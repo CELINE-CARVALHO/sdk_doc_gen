@@ -1,31 +1,38 @@
 """
 agents/doc_generator.py
-Generates documentation sections using LLM + RAG context.
+Generates deep, SDK-quality documentation using LLM + RAG context.
+Extracts reasoning, intent, logic flow, and full API surface per file.
 """
 
 import logging
-from typing import Dict, List, Optional
-
-from rag.retriever import VectorStore
+from typing import List, Dict, Optional
 from utils.llm_client import LLMClient
+from rag.retriever import VectorStore
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a strict, precise SDK documentation engine.
+SYSTEM_PROMPT = """You are an elite SDK documentation engine used by world-class engineering teams.
 
-RULES - FOLLOW EXACTLY:
-- Output ONLY Markdown. No prose introductions, no meta-commentary.
-- Every claim MUST be derived from the provided code context. Do NOT invent APIs, parameters, or behaviors.
-- If a detail is not present in the context, write: `<!-- not determinable from code -->` and move on.
-- Never write generic sentences like "This module provides functionality" or "This is useful for developers".
-- Be concise. Use bullet points and tables. Avoid paragraphs longer than 2 sentences.
-- Use exact function/class/variable names as they appear in the source code.
-- Do not hallucinate default values, types, or return types. Only state what the code confirms.
-- Format every code example as a fenced code block with the correct language tag."""
+ABSOLUTE RULES — NEVER VIOLATE:
+1. ONLY document what is explicitly present in the provided source code context.
+2. NEVER invent, assume, or hallucinate function names, parameters, return types, or behaviors.
+3. If a type annotation is missing from the code, write `Any` — do not guess.
+4. If a docstring exists in the code, quote it verbatim in italics. Do not paraphrase it.
+5. If something cannot be determined from the context, write: `*Not determinable from source.*`
+6. Output ONLY valid Markdown. Zero prose introductions. Zero filler sentences.
+7. Every code example must use REAL names from the source. Never write placeholder comments.
+8. Be surgical and precise. A developer will copy this into production documentation.
+
+REASONING EXTRACTION RULES:
+- Read the code deeply. Understand WHY it was written that way, not just WHAT it does.
+- Identify implicit contracts: what must be true BEFORE calling a function, and what is guaranteed AFTER.
+- Detect error conditions, edge cases, and side effects visible in the code.
+- Identify the design intent from class/function naming, inheritance, and composition patterns.
+- Surface non-obvious behavior: mutation of inputs, global state, thread safety, ordering requirements."""
 
 
 class DocGeneratorAgent:
-    """Generates comprehensive documentation from analysis and RAG context."""
+    """Generates deep, reasoning-aware documentation from source code via LLM + RAG."""
 
     def __init__(self, llm: LLMClient, vector_store: VectorStore):
         self.llm = llm
@@ -34,381 +41,423 @@ class DocGeneratorAgent:
     def _retrieve_context(self, query: str, top_k: int = 6) -> str:
         chunks = self.vs.retrieve(query, top_k=top_k)
         if not chunks:
-            return "No additional context available."
-
-        parts = []
-        for chunk in chunks:
-            parts.append(f"[{chunk['source']}]\n{chunk['text']}")
+            return "*No source context retrieved.*"
+        parts = [f"<!-- SOURCE: {c['source']} -->\n{c['text']}" for c in chunks]
         return "\n\n---\n\n".join(parts)
 
-    def generate_overview(self, analysis: Dict) -> str:
-        ctx = self._retrieve_context(
-            f"entry point main module imports exports {analysis.get('project_name', '')}",
-            top_k=5,
-        )
+    def generate_overview(self, analysis: Dict, files: List[Dict] = None) -> str:
+        ctx_parts = []
+        for q in [
+            f"entry point main module __init__ {analysis.get('project_name', '')}",
+            "class definition public interface exports purpose",
+            "README description goal problem",
+        ]:
+            ctx_parts.append(self._retrieve_context(q, top_k=4))
+        ctx = "\n\n===\n\n".join(ctx_parts)
 
-        prompt = f"""Produce a concise SDK-style project overview for `{analysis['project_name']}`.
+        prompt = f"""You are documenting `{analysis['project_name']}` for its SDK reference page.
 
-PROJECT METADATA:
+METADATA:
 {_fmt_analysis(analysis)}
 
-SOURCE CONTEXT:
+SOURCE CODE CONTEXT:
 {ctx}
 
-OUTPUT RULES:
-- Do NOT write a blog post. Write reference documentation.
-- Do NOT fabricate features. Only list what is confirmed by the metadata and context above.
-- Use exact names from the code (module names, class names, CLI commands, etc.).
+Extract deep understanding: What problem does this solve? What is the primary abstraction?
+What are the REAL capabilities derived from actual classes/functions?
 
-REQUIRED STRUCTURE - output exactly these sections, in this order:
+OUTPUT — EXACTLY this structure:
 
-# {analysis['project_name']}
+# `{analysis['project_name']}`
 
-> One sentence: what this project does and who it is for. Derived strictly from the code.
+> **One sentence.** What this does and who it is for. Derived strictly from the code.
 
-## Overview
-- 3-6 bullet points describing concrete capabilities. Each bullet must reference a real module, class, or function from the context.
+## What It Does
+*(2–4 sentences. Explain the core problem solved and approach. Reference actual module/class names.)*
 
-## Key Features
-| Feature | Description |
-|---------|-------------|
-(Populate only from confirmed code context. Max 6 rows.)
+## Key Capabilities
+*(Each bullet = one concrete capability backed by a real class or function from context. Format: `**Name** — description.`)*
+
+## Mental Model
+*(2–3 sentences. The primary abstraction a developer must internalize. What is the unit of work? What owns what?)*
 
 ## Tech Stack
-| Component | Technology | Role |
-|-----------|------------|------|
-(Use exact dependency names from requirements/imports. Max 8 rows.)
+| Component | Technology | Version / Notes |
+|-----------|------------|-----------------|
 
-## Architecture
-- Bullet-point description of top-level modules and their responsibilities.
-- One bullet per module/package. Use the exact directory/file names.
+## Project Layout
+```
+{analysis.get('file_tree', '(file tree not available)')}
+```
+*(After the tree, one bullet per top-level module explaining its role.)*"""
 
-Do not add any section not listed above."""
-
-        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=1000)
+        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=2000)
 
     def generate_installation(self, analysis: Dict, files: List[Dict]) -> str:
         setup_content = ""
-        setup_keywords = [
-            "requirements",
-            "setup.py",
-            "pyproject",
-            "package.json",
-            "go.mod",
-            "cargo.toml",
-            "gemfile",
-        ]
+        for f in files:
+            fname = f["path"].lower().split("/")[-1]
+            if any(kw in fname for kw in ["requirements", "setup.py", "pyproject.toml",
+                                           "package.json", "go.mod", "cargo.toml", "gemfile"]):
+                setup_content += f"\n<!-- FILE: {f['path']} -->\n```\n{f['content'][:1000]}\n```\n"
 
-        for file_info in files:
-            if any(kw in file_info["path"].lower() for kw in setup_keywords):
-                setup_content += (
-                    f"\n### {file_info['path']}\n"
-                    f"```\n{file_info['content'][:800]}\n```\n"
-                )
+        env_ctx = self._retrieve_context("os.getenv environ .env environment variable config", top_k=5)
 
-        ctx = self._retrieve_context(
-            "installation setup dependencies environment variables config",
-            top_k=4,
-        )
+        prompt = f"""Document the installation and setup procedure for `{analysis['project_name']}`.
 
-        prompt = f"""Generate a precise Installation & Setup reference for `{analysis['project_name']}`.
+LANGUAGE: {analysis.get('language', 'unknown')}
+FRAMEWORK: {analysis.get('framework', 'unknown')}
+DEPENDENCIES: {', '.join(analysis.get('dependencies', [])[:15]) or 'none detected'}
 
-DETECTED LANGUAGE: {analysis.get('language', 'unknown')}
-DETECTED FRAMEWORK: {analysis.get('framework', 'unknown')}
-DETECTED DEPENDENCIES: {', '.join(analysis.get('dependencies', [])[:15]) or 'none detected'}
+DEPENDENCY FILES:
+{setup_content or '*(No setup files found.)*'}
 
-SETUP FILES FROM REPOSITORY:
-{setup_content or '(No setup files detected in repository.)'}
+ENVIRONMENT VARIABLE USAGE IN SOURCE:
+{env_ctx}
 
-ADDITIONAL CONTEXT:
-{ctx}
+RULES:
+- Use EXACT package names from the dependency files above.
+- List ONLY env vars that appear in the source context.
+- If no env vars detected, omit the Environment section entirely.
+- Version numbers must come from dependency files — do not invent them.
+- Verification step must use a real import or command from the code.
 
-OUTPUT RULES:
-- Use only information derived from the setup files and context above.
-- Do NOT invent install commands. Use the exact package names from the dependency files.
-- If environment variables are referenced in the code, list each one explicitly.
-- If no .env usage is detected, omit the Environment Variables section entirely.
-
-REQUIRED STRUCTURE:
+OUTPUT — EXACTLY this structure:
 
 ## Installation
 
 ### Prerequisites
-- List runtime/tool prerequisites (e.g., Python >= 3.9, Node.js >= 18). Base version requirements on what the setup files specify.
+*(Runtime requirements: language version, system tools. Base on setup files. If unspecified, say so.)*
 
-### Install Dependencies
-```(language)
-(exact install commands derived from setup files)
+### Install
+```bash
+(exact commands from dependency files)
 ```
 
-### Environment Configuration
-(Include ONLY if .env / os.getenv / environment variables are detected in context.)
+### Environment Variables
+*(Include ONLY if env vars detected in source.)*
 
-| Variable | Required | Description | Example |
-|----------|----------|-------------|---------|
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
 
-### Verify Installation
-```(language)
-(minimal command to confirm the install works - e.g., running --version or a smoke-test import)
-```
+### Verify
+```{analysis.get('language', 'bash').lower()}
+(smoke-test using real module/class names from the code)
+```"""
 
-Do not add any section not listed above."""
+        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=1500)
 
-        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=900)
-
-    def generate_api_docs(self, analysis: Dict) -> str:
+    def generate_api_docs(self, analysis: Dict, files: List[Dict] = None) -> str:
         ctx = self._retrieve_context(
-            f"class def function method return type parameter signature decorator "
-            f"{analysis.get('project_name', '')}",
-            top_k=12,
+            "class def function method __init__ return raise parameter self async property staticmethod classmethod decorator",
+            top_k=15,
         )
 
-        prompt = f"""Generate complete SDK-style API Reference documentation for `{analysis['project_name']}`.
+        prompt = f"""Produce a COMPLETE SDK-style API Reference for `{analysis['project_name']}`.
 
-SOURCE CODE CONTEXT (ground truth - document ONLY what appears here):
+SOURCE CODE — your ONLY ground truth. Document everything visible here:
 {ctx}
 
-OUTPUT RULES:
-- Structure output STRICTLY as: File -> Class -> Method/Function.
-- Document every class, function, and method visible in the context. Do not skip any.
-- Do NOT document private members (names starting with `_`) unless they are explicitly exposed in a public API.
-- Do NOT hallucinate parameter names, types, default values, or return types.
-  If a type annotation is absent from the code, write the type as `unknown`.
-- If a docstring exists in the code, quote it verbatim under the item. Do not paraphrase.
-- If a detail cannot be determined from the context, write: `<!-- not determinable from code -->`.
-- Every method/function entry MUST include a minimal usage example derived from actual call sites in the context,
-  or constructed from the real signature if no call site is present.
+EXTRACTION RULES:
+- Document EVERY class, public function, and public method visible in the context.
+- For each item extract:
+  1. Exact signature with type annotations as written (use `Any` if unannotated)
+  2. Purpose from docstring (verbatim) or inferred from implementation (mark as *(inferred)*)
+  3. All parameters: name, type, default value, what it controls
+  4. Return value: type and what it represents
+  5. All exceptions raised: type and the condition that triggers each
+  6. Pre-conditions: what must be true before calling (from assertions, validation code)
+  7. Side effects: state mutations, I/O, writes, external calls
+  8. Minimal real usage example using exact names from source
+- Skip private members (prefix `_`) unless called from the public interface.
+- Group by file/module.
 
-REQUIRED FORMAT - follow this exact heading hierarchy:
+OUTPUT FORMAT — follow this hierarchy EXACTLY:
+
+---
 
 ## API Reference
 
 ---
 
-## File: `path/to/file.py`
+## Module: `path/to/file.py`
+
+*(One sentence: this module's responsibility in the system.)*
+
+---
 
 ### Class: `ClassName`
 
-> (One sentence from the class docstring or inferred strictly from its `__init__` and method signatures.)
+```python
+class ClassName(BaseClass):
+```
+
+> *(Docstring verbatim — or inferred purpose marked *(inferred)*.)*
+
+**Inherits from:** `BaseClass` *(or "None")*
 
 **Constructor**
+
 ```python
-ClassName(param1: type, param2: type = default)
+def __init__(self, param1: Type1, param2: Type2 = default) -> None
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| param1 | type | - | (from docstring or code) |
+| `param1` | `Type1` | — | *(what it controls)* |
+
+**Instance Attributes**
+
+| Attribute | Type | Set In | Description |
+|-----------|------|--------|-------------|
+| `self.attr` | `Type` | `__init__` | *(what it holds)* |
 
 ---
 
 #### Method: `method_name()`
 
 ```python
-def method_name(self, param: type) -> return_type
+def method_name(self, param: Type, flag: bool = False) -> ReturnType
 ```
+
+> *(Docstring or inferred purpose.)*
 
 **Parameters**
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| param | type | - | (from docstring or code) |
+| `param` | `Type` | — | *(description)* |
 
-**Returns:** `return_type` - description.
+**Returns:** `ReturnType` — *(what it represents)*
 
-**Raises:** `ExceptionType` - condition. (Omit this row if no exceptions are raised or documented.)
+**Raises:**
+- `ExceptionType` — *(condition)*
+
+**Pre-conditions:** *(what must be true before calling — or "None detected.")*
+
+**Side effects:** *(mutations, I/O, external calls — or "None detected.")*
 
 **Example**
 ```python
-# minimal working example using real names from the code
-instance = ClassName(...)
-result = instance.method_name(...)
+# Using real names from the source
+obj = ClassName(actual_value)
+result = obj.method_name(real_param)
 ```
 
 ---
 
 ### Function: `function_name()`
 
-(Same structure as Method above, omitting `self`.)
+*(Same structure as Method, without `self`.)*
 
 ---
 
-(Repeat File / Class / Function blocks for every file present in the context.)"""
+*(Repeat for EVERY item in the source context. Do not skip any.)*"""
 
-        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=1200)
+        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=4096)
 
     def generate_architecture_doc(self, analysis: Dict) -> str:
         ctx = self._retrieve_context(
-            "module imports pipeline flow data transformation class inheritance dependency injection",
-            top_k=6,
+            "import from module pipeline flow inheritance composition dependency inject factory singleton abstract",
+            top_k=8,
         )
 
-        prompt = f"""Generate a precise Architecture & Design reference for `{analysis['project_name']}`.
+        prompt = f"""Document the architecture and internal design of `{analysis['project_name']}`.
 
-PROJECT METADATA:
+METADATA:
 {_fmt_analysis(analysis)}
-
-SOURCE CONTEXT:
-{ctx}
 
 FILE TREE:
 {analysis.get('file_tree', '(not available)')}
 
-OUTPUT RULES:
-- Do NOT write prose paragraphs. Use bullet points, tables, and short descriptions.
-- Every module listed must correspond to an actual file/directory in the file tree or context.
-- Do not invent design patterns. Only name a pattern if it is clearly implemented in the code.
-- Data flow steps must reference real function/method names from the context.
+SOURCE CONTEXT (imports, class hierarchies, module relationships):
+{ctx}
 
-REQUIRED STRUCTURE:
+EXTRACTION RULES:
+- Map EVERY module dependency from import statements visible in context.
+- Trace the execution flow using real function/method names.
+- Name design patterns ONLY if clearly implemented in the code.
+- Describe the lifecycle of the primary object from creation to disposal.
+
+OUTPUT — EXACTLY this structure:
 
 ## Architecture & Design
 
-### Module Responsibilities
-| Module / File | Responsibility |
-|---------------|----------------|
-(One row per top-level file or package. Use exact names from the file tree.)
+### System Responsibility Map
+| Module / File | Responsibility | Owned Abstractions |
+|---------------|----------------|-------------------|
 
-### Component Dependencies
-- List which modules import from which. Use `A -> B` notation to mean "A depends on B".
-- Derive strictly from import statements visible in the context.
+### Dependency Graph
+*(A → B means "A depends on B". Derived from import statements.)*
+```
+(plain-text dependency arrows)
+```
 
-### Data Flow
-1. (Step 1: entry point - exact function/class name)
-2. (Step 2: transformation - exact function/class name)
-3. (Continue for each major step visible in the code.)
+### Execution Flow
+*(Trace primary use case from entry point to result using exact function names.)*
+
+1. **Entry:** `module.function()` — *(what triggers it)*
+2. **Step:** `module.function()` — *(what happens)*
+*(continue for each major step)*
 
 ### Design Patterns
-| Pattern | Where Applied | Evidence from Code |
-|---------|---------------|--------------------|
-(Only include patterns that are directly observable in the context. Omit table if none are confirmed.)
+| Pattern | Location | Evidence in Code |
+|---------|----------|-----------------|
+*(ONLY patterns directly observable. If none: "No canonical patterns detected.")*
+
+### Key Design Decisions
+*(5 bullets. Each explains WHY the code is structured this way — infer from naming, composition, layering. Mark each *(inferred)* if not from a comment.)*
 
 ### Directory Structure
-(Reproduce the file tree exactly as provided above. Do not modify it.)
+```
+{analysis.get('file_tree', '(not available)')}
+```"""
 
-Do not add any section not listed above."""
-
-        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=1000)
+        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=2000)
 
     def generate_usage_guide(self, analysis: Dict) -> str:
         ctx = self._retrieve_context(
-            f"example usage instantiation call invoke import main entry __main__ "
-            f"{analysis.get('project_name', '')}",
-            top_k=8,
+            "example usage import instantiate call invoke __main__ demo test fixture client",
+            top_k=10,
         )
 
-        prompt = f"""Generate a concise Usage Guide for `{analysis['project_name']}`.
+        prompt = f"""Write the Usage Guide for `{analysis['project_name']}`.
 
-PROJECT METADATA:
+METADATA:
 {_fmt_analysis(analysis)}
 
-SOURCE CONTEXT (use real names, signatures, and patterns from here):
+SOURCE CONTEXT (call sites, examples, entry points, test fixtures):
 {ctx}
 
-OUTPUT RULES:
-- Every code example MUST use real class/function/variable names from the context.
-- Do NOT fabricate method calls or import paths. If you cannot confirm a call from the context, omit it.
-- Quick Start must be the minimal sequence of steps to produce a working result.
-- Each use-case example must focus on a distinct capability confirmed by the source.
-- Do not write motivational copy or filler sentences.
+RULES:
+- Quick Start = MINIMUM sequence of real function calls to produce a result.
+- Every code example must use EXACT class/function names from the context.
+- NEVER write placeholder examples. Use real API names only.
+- Each use case demonstrates a DISTINCT capability visible in source.
+- Gotchas must come from observable code behavior.
 
-REQUIRED STRUCTURE:
+OUTPUT — EXACTLY this structure:
 
 ## Usage Guide
 
 ### Quick Start
-```(language)
-# Minimal working example - every line must be derivable from the source context.
+
+```python
+from {analysis.get('project_name', 'module').replace('-','_').replace(' ','_')} import RealClassName
+
+obj = RealClassName(real_param)
+result = obj.real_method()
+print(result)
 ```
 
-### Common Use Cases
+### Use Case 1: *(name it after a specific capability)*
 
-#### (Use Case 1 Title - name it after the specific capability)
-```(language)
-# Example code using real APIs from the context
+```python
+# Complete runnable example
 ```
-- (1-2 bullets explaining what this example does and any non-obvious behavior)
 
-#### (Use Case 2 Title)
-```(language)
-# Example code
+**What this does:**
+- *(key behavior)*
+- *(non-obvious detail or required ordering)*
+
+### Use Case 2: *(name)*
+
+```python
 ```
-- (bullets)
 
-(Add up to 4 use cases total. Only include a use case if it is confirmed by the context.)
+**What this does:**
+- *(bullets)*
 
-### Configuration Options
-(Include ONLY if configurable parameters/env vars are detected in the context.)
+### Use Case 3: *(name)*
 
-| Option | Type | Default | Effect |
-|--------|------|---------|--------|
+```python
+```
 
-### Common Patterns & Pitfalls
-- (Bullet list of real gotchas, ordering requirements, or non-obvious behaviors visible in the code.)
-- (If none are determinable from the context, omit this section entirely.)
+**What this does:**
+- *(bullets)*
 
-Do not add any section not listed above."""
+*(Max 4 use cases. Only include if backed by the source context.)*
 
-        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=1000)
+### Error Handling
+
+```python
+# Real exception types from source
+```
+
+| Exception | When It Occurs | How to Handle |
+|-----------|---------------|---------------|
+
+### Gotchas & Non-Obvious Behavior
+- *(Real behavioral quirk from code: ordering, mutation, state requirement, etc.)*
+- *(If none detectable: "No gotchas detected from source.")*"""
+
+        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=2500)
 
     def generate_configuration_doc(self, analysis: Dict, files: List[Dict]) -> Optional[str]:
-        config_files = [
-            file_info
-            for file_info in files
-            if any(
-                kw in file_info["path"].lower()
-                for kw in [".env", "config", "settings", ".yaml", ".yml", ".toml", ".ini"]
-            )
-        ]
+        config_files = [f for f in files if any(
+            kw in f["path"].lower()
+            for kw in [".env", "config", "settings", ".yaml", ".yml", ".toml", ".ini", ".cfg"]
+        )]
         if not config_files:
             return None
 
-        config_snippets = "\n".join(
-            f"### {file_info['path']}\n```\n{file_info['content'][:600]}\n```"
-            for file_info in config_files[:5]
+        config_snippets = "\n\n".join(
+            f"<!-- FILE: {f['path']} -->\n```\n{f['content'][:800]}\n```"
+            for f in config_files[:6]
+        )
+        env_ctx = self._retrieve_context(
+            "os.getenv os.environ getenv environ config settings default value required", top_k=6
         )
 
-        prompt = f"""Generate a Configuration Reference for `{analysis.get('project_name', 'this project')}`.
+        prompt = f"""Document every configuration option for `{analysis.get('project_name', 'this project')}`.
 
-CONFIGURATION FILES FROM REPOSITORY:
+CONFIGURATION FILES:
 {config_snippets}
 
-OUTPUT RULES:
-- Document ONLY configuration keys/variables that appear in the files above.
-- Do NOT invent keys or default values. If a default is not set in the file, write `-` in the Default column.
-- If a key's purpose is not clear from its name or surrounding comments, write `<!-- purpose not determinable from code -->`.
-- Group variables by the file they appear in.
+ENVIRONMENT VARIABLE USAGE IN SOURCE:
+{env_ctx}
 
-REQUIRED STRUCTURE:
+RULES:
+- Document ONLY keys/variables present in the files or source context above.
+- Default column: actual default from code or file. If none exists, write `—`.
+- Type: infer from value format (string, int, bool, path, URL).
+- Required = Yes if no default exists anywhere in code or config.
+- If a key's purpose is unclear from its name, infer from surrounding code.
+
+OUTPUT — EXACTLY this structure:
 
 ## Configuration
+
+*(One table per configuration file.)*
 
 ### `(filename)`
 
 | Key | Type | Default | Required | Description |
 |-----|------|---------|----------|-------------|
-(One row per config key found in this file.)
 
-(Repeat the table block for each config file.)
+### Environment Variables
 
-### Notes
-- (Any cross-cutting constraints visible in the config files - e.g., mutual exclusivity, ordering, format requirements.)
-- (Omit this section if no such constraints are present.)
+| Variable | Type | Default | Required | Description |
+|----------|------|---------|----------|-------------|
+*(One row per os.getenv call detected. Omit this section if none detected.)*
 
-Do not add any section not listed above."""
+### Configuration Precedence
+*(Which source takes priority if multiple exist? Infer from code loading order. If not determinable, say so.)*"""
 
-        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=800)
+        return self.llm.simple_prompt(prompt, system=SYSTEM_PROMPT, max_tokens=1500)
 
 
 def _fmt_analysis(analysis: Dict) -> str:
-    lines = [
-        f"Project: {analysis.get('project_name', 'unknown')}",
-        f"Description: {analysis.get('description', '')}",
-        f"Language: {analysis.get('language', '')}",
-        f"Framework: {analysis.get('framework', '')}",
-        f"Architecture: {analysis.get('architecture', '')}",
-        f"Features: {', '.join(analysis.get('features', [])[:8])}",
-        f"Key Components: {', '.join(c.get('name', '') for c in analysis.get('key_components', [])[:6])}",
-        f"Complexity: {analysis.get('complexity', '')}",
-    ]
-    return "\n".join(lines)
+    components = ", ".join(c.get("name", "") for c in analysis.get("key_components", [])[:8])
+    return "\n".join([
+        f"Project      : {analysis.get('project_name', 'unknown')}",
+        f"Description  : {analysis.get('description', 'not available')}",
+        f"Language     : {analysis.get('language', 'unknown')}",
+        f"Framework    : {analysis.get('framework', 'unknown')}",
+        f"Architecture : {analysis.get('architecture', 'unknown')}",
+        f"Complexity   : {analysis.get('complexity', 'unknown')}",
+        f"Features     : {', '.join(analysis.get('features', [])[:8]) or 'none detected'}",
+        f"Components   : {components or 'none detected'}",
+        f"Dependencies : {', '.join(analysis.get('dependencies', [])[:12]) or 'none detected'}",
+        f"Entry Points : {', '.join(analysis.get('entry_points', [])[:5]) or 'none detected'}",
+    ])
