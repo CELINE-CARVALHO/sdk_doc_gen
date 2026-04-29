@@ -38,11 +38,25 @@ class DocGeneratorAgent:
         self.llm = llm
         self.vs = vector_store
 
-    def _retrieve_context(self, query: str, top_k: int = 6) -> str:
+    def _retrieve_context(
+        self,
+        query: str,
+        top_k: int = 6,
+        max_chars: int = 3600,
+        per_chunk_chars: int = 900,
+    ) -> str:
         chunks = self.vs.retrieve(query, top_k=top_k)
         if not chunks:
             return "*No source context retrieved.*"
-        parts = [f"<!-- SOURCE: {c['source']} -->\n{c['text']}" for c in chunks]
+        parts = []
+        used_chars = 0
+        for chunk in chunks:
+            excerpt = _compact_source_excerpt(chunk["text"], per_chunk_chars)
+            part = f"<!-- SOURCE: {chunk['source']} -->\n{excerpt}"
+            if used_chars + len(part) > max_chars and parts:
+                break
+            parts.append(part[: max_chars - used_chars])
+            used_chars += len(parts[-1])
         return "\n\n---\n\n".join(parts)
 
     def generate_overview(self, analysis: Dict, files: List[Dict] = None) -> str:
@@ -52,7 +66,7 @@ class DocGeneratorAgent:
             "class definition public interface exports purpose",
             "README description goal problem",
         ]:
-            ctx_parts.append(self._retrieve_context(q, top_k=4))
+            ctx_parts.append(self._retrieve_context(q, top_k=3, max_chars=1800, per_chunk_chars=650))
         ctx = "\n\n===\n\n".join(ctx_parts)
 
         prompt = f"""You are documenting `{analysis['project_name']}` for its SDK reference page.
@@ -101,7 +115,12 @@ OUTPUT — EXACTLY this structure:
                                            "package.json", "go.mod", "cargo.toml", "gemfile"]):
                 setup_content += f"\n<!-- FILE: {f['path']} -->\n```\n{f['content'][:1000]}\n```\n"
 
-        env_ctx = self._retrieve_context("os.getenv environ .env environment variable config", top_k=5)
+        env_ctx = self._retrieve_context(
+            "os.getenv environ .env environment variable config",
+            top_k=4,
+            max_chars=2000,
+            per_chunk_chars=700,
+        )
 
         prompt = f"""Document the installation and setup procedure for `{analysis['project_name']}`.
 
@@ -150,7 +169,9 @@ OUTPUT — EXACTLY this structure:
     def generate_api_docs(self, analysis: Dict, files: List[Dict] = None) -> str:
         ctx = self._retrieve_context(
             "class def function method __init__ return raise parameter self async property staticmethod classmethod decorator",
-            top_k=15,
+            top_k=12,
+            max_chars=6500,
+            per_chunk_chars=750,
         )
 
         prompt = f"""Produce a COMPLETE SDK-style API Reference for `{analysis['project_name']}`.
@@ -260,6 +281,8 @@ result = obj.method_name(real_param)
         ctx = self._retrieve_context(
             "import from module pipeline flow inheritance composition dependency inject factory singleton abstract",
             top_k=8,
+            max_chars=4200,
+            per_chunk_chars=800,
         )
 
         prompt = f"""Document the architecture and internal design of `{analysis['project_name']}`.
@@ -319,6 +342,8 @@ OUTPUT — EXACTLY this structure:
         ctx = self._retrieve_context(
             "example usage import instantiate call invoke __main__ demo test fixture client",
             top_k=10,
+            max_chars=5000,
+            per_chunk_chars=800,
         )
 
         prompt = f"""Write the Usage Guide for `{analysis['project_name']}`.
@@ -406,7 +431,10 @@ print(result)
             for f in config_files[:6]
         )
         env_ctx = self._retrieve_context(
-            "os.getenv os.environ getenv environ config settings default value required", top_k=6
+            "os.getenv os.environ getenv environ config settings default value required",
+            top_k=5,
+            max_chars=3200,
+            per_chunk_chars=750,
         )
 
         prompt = f"""Document every configuration option for `{analysis.get('project_name', 'this project')}`.
@@ -461,3 +489,35 @@ def _fmt_analysis(analysis: Dict) -> str:
         f"Dependencies : {', '.join(analysis.get('dependencies', [])[:12]) or 'none detected'}",
         f"Entry Points : {', '.join(analysis.get('entry_points', [])[:5]) or 'none detected'}",
     ])
+
+
+def _compact_source_excerpt(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+
+    lines = text.splitlines()
+    important_prefixes = (
+        "class ",
+        "def ",
+        "async def ",
+        "import ",
+        "from ",
+        "@",
+        "raise ",
+        "return ",
+    )
+    kept = []
+    used = 0
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(important_prefixes) or stripped.startswith(('"""', "'''")):
+            if used + len(line) + 1 > max_chars:
+                break
+            kept.append(line)
+            used += len(line) + 1
+
+    if kept and used >= max_chars * 0.35:
+        return "\n".join(kept)
+
+    return text[:max_chars].rstrip() + "\n# ... excerpt trimmed for Groq token budget ..."
